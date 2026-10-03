@@ -32,6 +32,11 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
+# 兼容新版 MSVC(VS18 / MSVC 14.5x)：flutter_inappwebview_windows、
+# permission_handler_windows 等插件仍使用 <experimental/coroutine>，
+# 新版 STL 已把该弃用警告升级为编译错误(STL1011)，这里全局关掉。
+add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by
