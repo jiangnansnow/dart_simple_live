@@ -52,6 +52,36 @@ mixin PlayerMixin {
     if(Platform.isAndroid){
       await pp.setProperty('force-seekable', 'yes');
     }
+    // Windows 直播场景的 mpv 参数：开缓冲 + 允许丢帧，缓解网络抖动造成的卡顿
+    if (Platform.isWindows) {
+      await _setPropertySafe(pp, 'cache', 'yes');
+      await _setPropertySafe(pp, 'demuxer-readahead-secs', '3');
+      await _setPropertySafe(pp, 'demuxer-max-bytes', '32MiB');
+      await _setPropertySafe(pp, 'network-timeout', '10');
+      await _setPropertySafe(pp, 'framedrop', 'decoder+vo');
+      await _setPropertySafe(pp, 'video-sync', 'audio');
+      // 明确指定硬解后端，避免自动选择来回抖动（d3d11va-copy 会把帧拷回内存）
+      await _setPropertySafe(
+        pp,
+        'hwdec',
+        AppSettingsController.instance.hardwareDecode.value
+            ? 'd3d11va-copy'
+            : 'no',
+      );
+    }
+  }
+
+  /// 设置 mpv 属性，失败不影响播放（不同 media_kit/mpv 版本支持的属性有差异）
+  Future<void> _setPropertySafe(
+    NativePlayer pp,
+    String key,
+    String value,
+  ) async {
+    try {
+      await pp.setProperty(key, value);
+    } catch (e) {
+      Log.d("设置播放器属性 $key 失败：$e");
+    }
   }
 
   /// 视频控制器
@@ -836,13 +866,34 @@ class PlayerController extends BaseController
   @override
   void onClose() async {
     Log.w("播放器关闭");
-    if (smallWindowState.value) {
-      exitSmallWindow();
+    try {
+      if (smallWindowState.value) {
+        exitSmallWindow();
+      }
+      // 1. 先断开事件流：避免 stop/dispose 触发 completed/error 回调再次发起重连
+      disposeStream();
+      disposeDanmakuController();
+      // 2. 先 stop，让 mpv 退出 demux/解码循环再释放
+      //    mpv 卡在错误态时 dispose 会长时间阻塞 Dart isolate，表现为界面假死
+      try {
+        await player.stop();
+      } catch (e) {
+        Log.d("停止播放失败：$e");
+      }
+      await resetSystem();
+      // 3. dispose 加超时兜底，超时不再等待，避免返回直播间时卡死
+      try {
+        await player.dispose().timeout(
+          const Duration(seconds: 3),
+          onTimeout: () {
+            Log.w("播放器释放超时，已跳过等待");
+          },
+        );
+      } catch (e) {
+        Log.d("释放播放器失败：$e");
+      }
+    } finally {
+      super.onClose();
     }
-    disposeStream();
-    disposeDanmakuController();
-    await resetSystem();
-    await player.dispose();
-    super.onClose();
   }
 }

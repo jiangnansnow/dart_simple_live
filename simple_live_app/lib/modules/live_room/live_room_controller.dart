@@ -441,18 +441,77 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     await player.jump(currentLineIndex);
   }
 
+  int mediaErrorRetryCount = 0;
+
+  /// 页面是否已销毁：销毁后禁止再操作播放器（返回时闪退的根因之一）
+  bool _disposed = false;
+
+  /// 是否正在切换播放地址：防止并发 jump/open 叠加造成重连风暴
+  bool _switchingMedia = false;
+
+  /// 可取消的重连定时器：返回时直接 cancel，杜绝播放器释放后再被回调
+  Timer? _retryTimer;
+
+  /// 统一重连入口：串行执行 + 指数退避 + 可取消 + 超次重新拉流地址
+  void scheduleRetry(String reason) {
+    if (_disposed || _switchingMedia || _retryTimer != null) return;
+    mediaErrorRetryCount += 1;
+    Log.d("$reason，尝试第$mediaErrorRetryCount次刷新");
+    // 1s -> 3s -> 8s 退避，避免 mpv 反复重建 demuxer/decoder 拖垮 UI 线程
+    final int seconds =
+        mediaErrorRetryCount == 1 ? 1 : (mediaErrorRetryCount == 2 ? 3 : 8);
+    _retryTimer = Timer(Duration(seconds: seconds), () async {
+      _retryTimer = null;
+      if (_disposed) return;
+      _switchingMedia = true;
+      try {
+        if (mediaErrorRetryCount > 2) {
+          // 斗鱼等平台的播放地址带 wsAuth/token，有效期只有 300 秒，
+          // 必须用新地址重开，而不是拿旧 URL jump（旧令牌必然连不上）
+          await refreshPlayUrl();
+        } else {
+          await player.jump(currentLineIndex);
+        }
+      } catch (e) {
+        Log.d("重连失败：$e");
+      } finally {
+        _switchingMedia = false;
+      }
+    });
+  }
+
+  /// 重新拉取播放地址并用新地址打开（旧 URL 的播放令牌会过期）
+  Future<void> refreshPlayUrl() async {
+    if (_disposed) return;
+    try {
+      var playUrl = await site.liveSite.getPlayUrls(
+        detail: detail.value!,
+        quality: qualites[currentQuality],
+      );
+      if (_disposed) return;
+      if (playUrl.urls.isEmpty) {
+        errorMsg.value = "播放失败";
+        return;
+      }
+      playUrls.value = playUrl.urls;
+      playHeaders = playUrl.headers;
+      if (currentLineIndex < 0 || currentLineIndex >= playUrls.length) {
+        currentLineIndex = 0;
+      }
+      mediaErrorRetryCount = 0;
+      await initPlaylist();
+    } catch (e) {
+      Log.d("刷新播放地址失败：$e");
+      errorMsg.value = "播放失败";
+    }
+  }
+
   @override
   void mediaEnd() async {
     super.mediaEnd();
-    if (mediaErrorRetryCount < 2) {
-      Log.d("播放结束，尝试第${mediaErrorRetryCount + 1}次刷新");
-      if (mediaErrorRetryCount == 1) {
-        //延迟一秒再刷新
-        await Future.delayed(const Duration(seconds: 1));
-      }
-      mediaErrorRetryCount += 1;
-      //刷新一次
-      setPlayer();
+    if (_disposed) return;
+    if (mediaErrorRetryCount < 3) {
+      scheduleRetry("播放结束");
       return;
     }
 
@@ -462,24 +521,15 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       liveStatus.value = false;
     } else {
       changePlayLine(currentLineIndex + 1);
-
-      //setPlayer();
     }
   }
 
-  int mediaErrorRetryCount = 0;
   @override
   void mediaError(String error) async {
     super.mediaEnd();
-    if (mediaErrorRetryCount < 2) {
-      Log.d("播放失败，尝试第${mediaErrorRetryCount + 1}次刷新");
-      if (mediaErrorRetryCount == 1) {
-        //延迟一秒再刷新
-        await Future.delayed(const Duration(seconds: 1));
-      }
-      mediaErrorRetryCount += 1;
-      //刷新一次
-      setPlayer();
+    if (_disposed) return;
+    if (mediaErrorRetryCount < 3) {
+      scheduleRetry("播放失败");
       return;
     }
 
@@ -487,8 +537,6 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       errorMsg.value = "播放失败";
       SmartDialog.showToast("播放失败:$error");
     } else {
-      //currentLineIndex += 1;
-      //setPlayer();
       changePlayLine(currentLineIndex + 1);
     }
   }
@@ -1053,6 +1101,10 @@ ${error?.stackTrace}''');
 
   @override
   void onClose() {
+    // 先置位并取消重连，避免播放器释放后再被回调（返回时卡死/闪退的关键）
+    _disposed = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
     WidgetsBinding.instance.removeObserver(this);
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();
