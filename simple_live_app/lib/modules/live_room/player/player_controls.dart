@@ -673,7 +673,9 @@ Widget buildDanmuView(VideoState videoState, LiveRoomController controller) {
                       AppSettingsController.instance.danmuBottomMargin.value,
                 )
               : EdgeInsets.zero,
-          child: controller.danmakuView!,
+          child: RepaintBoundary(
+            child: controller.danmakuView!,
+          ),
         ),
       ),
     ),

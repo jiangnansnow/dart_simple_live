@@ -228,11 +228,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         }
       }
 
-      messages.add(msg);
-
-      WidgetsBinding.instance.addPostFrameCallback(
-        (_) => chatScrollToBottom(),
-      );
+      _enqueueMessage(msg);
       if (!liveStatus.value || isBackground) {
         return;
       }
@@ -252,6 +248,37 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       online.value = msg.data;
     } else if (msg.type == LiveMessageType.superChat) {
       superChats.add(msg.data);
+    }
+  }
+
+  /// 将聊天消息放入缓冲，批量提交，避免逐条触发列表重建
+  void _enqueueMessage(LiveMessage msg) {
+    _messageBuffer.add(msg);
+    _messageFlushTimer ??=
+        Timer(const Duration(milliseconds: 300), _flushMessages);
+  }
+
+  /// 批量提交缓冲中的聊天消息，并在需要时一次性滚动到底部
+  void _flushMessages() {
+    _messageFlushTimer = null;
+    if (_disposed || _messageBuffer.isEmpty) return;
+    final batch = List<LiveMessage>.of(_messageBuffer);
+    _messageBuffer.clear();
+
+    // 超出上限时一次性裁剪，避免逐条 removeAt 反复重建
+    final overflow = (messages.length + batch.length) - _maxMessages;
+    if (overflow > 0) {
+      final removeCount = overflow.clamp(0, messages.length).toInt();
+      if (removeCount > 0) {
+        messages.removeRange(0, removeCount);
+      }
+    }
+    messages.addAll(batch);
+
+    if (!disableAutoScroll.value) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => chatScrollToBottom(),
+      );
     }
   }
 
@@ -402,6 +429,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     }
     playUrls.value = playUrl.urls;
     playHeaders = playUrl.headers;
+    _playUrlFetchedAt = DateTime.now();
     currentLineIndex = 0;
     currentLineInfo.value = "线路${currentLineIndex + 1}";
     //重置错误次数
@@ -443,6 +471,21 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   int mediaErrorRetryCount = 0;
 
+  /// 播放地址的获取时间：斗鱼等平台的 wsAuth/token 有效期只有 300 秒
+  DateTime? _playUrlFetchedAt;
+
+  /// 播放地址认为已过期的时间阈值（秒）
+  static const int _playUrlTtlSeconds = 240;
+
+  /// 聊天消息缓冲：热门房间每秒可达数十条，逐条 add 会让列表反复重建
+  final List<LiveMessage> _messageBuffer = [];
+
+  /// 聊天消息批量提交定时器
+  Timer? _messageFlushTimer;
+
+  /// 聊天消息保留上限
+  static const int _maxMessages = 200;
+
   /// 页面是否已销毁：销毁后禁止再操作播放器（返回时闪退的根因之一）
   bool _disposed = false;
 
@@ -465,9 +508,12 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       if (_disposed) return;
       _switchingMedia = true;
       try {
-        if (mediaErrorRetryCount > 2) {
-          // 斗鱼等平台的播放地址带 wsAuth/token，有效期只有 300 秒，
-          // 必须用新地址重开，而不是拿旧 URL jump（旧令牌必然连不上）
+        // 播放地址令牌 300 秒过期，超过阈值就必须重新取地址，
+        // 拿旧 URL jump 必然失败，只会空转消耗资源
+        final urlAgeSeconds = _playUrlFetchedAt == null
+            ? 9999
+            : DateTime.now().difference(_playUrlFetchedAt!).inSeconds;
+        if (urlAgeSeconds > _playUrlTtlSeconds || mediaErrorRetryCount > 2) {
           await refreshPlayUrl();
         } else {
           await player.jump(currentLineIndex);
@@ -495,6 +541,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       }
       playUrls.value = playUrl.urls;
       playHeaders = playUrl.headers;
+      _playUrlFetchedAt = DateTime.now();
       if (currentLineIndex < 0 || currentLineIndex >= playUrls.length) {
         currentLineIndex = 0;
       }
@@ -1105,6 +1152,9 @@ ${error?.stackTrace}''');
     _disposed = true;
     _retryTimer?.cancel();
     _retryTimer = null;
+    _messageFlushTimer?.cancel();
+    _messageFlushTimer = null;
+    _messageBuffer.clear();
     WidgetsBinding.instance.removeObserver(this);
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();

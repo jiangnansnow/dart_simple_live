@@ -241,14 +241,34 @@ mixin PlayerDanmakuMixin on PlayerStateMixin {
   }
 
   void disposeDanmakuController() {
+    _danmakuFlushTimer?.cancel();
+    _danmakuFlushTimer = null;
+    _danmakuBuffer.clear();
     danmakuController?.clear();
   }
+
+  /// 弹幕缓冲：热门房间每秒上百条，逐条提交会让 Canvas 绘制成为瓶颈
+  final List<DanmakuContentItem> _danmakuBuffer = [];
+  Timer? _danmakuFlushTimer;
+
+  /// 每批最多提交的弹幕条数（约 50 条/秒），超出部分丢弃，保证不掉帧
+  static const int _danmakuMaxPerFlush = 6;
 
   void addDanmaku(List<DanmakuContentItem> items) {
     if (!showDanmakuState.value) {
       return;
     }
-    for (var item in items) {
+    _danmakuBuffer.addAll(items);
+    _danmakuFlushTimer ??=
+        Timer(const Duration(milliseconds: 120), _flushDanmaku);
+  }
+
+  void _flushDanmaku() {
+    _danmakuFlushTimer = null;
+    if (_danmakuBuffer.isEmpty) return;
+    final batch = _danmakuBuffer.take(_danmakuMaxPerFlush).toList();
+    _danmakuBuffer.clear();
+    for (var item in batch) {
       danmakuController?.addDanmaku(item);
     }
   }
